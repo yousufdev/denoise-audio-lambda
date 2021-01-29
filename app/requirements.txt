@@ -1,0 +1,3 @@
+noisereduce
+boto3
+ffmpeg-python
