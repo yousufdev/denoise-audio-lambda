@@ -6,6 +6,7 @@ import soundfile as sf
 import boto3
 import ffmpeg
 import logging
+from itertools import count
 import os
 from urllib.parse import unquote_plus
 from pathlib import Path
@@ -24,6 +25,8 @@ logger.setLevel(logging.ERROR)
 # Load the noise
 noise, _ = sf.read(noise_dir / "noise.wav")
 allowed_extensions = ["3gp", "m4a"]
+audio_chunk_size = 10 * 60  # 10 minutes
+output_path = "/tmp/{}.{}"
 
 
 def download_s3_object(bucket_name, key: str, output_path):
@@ -53,11 +56,29 @@ def extract_s3_key_components(key: str):
     return prefix, name, ext
 
 
+def reduce_noise(name, ext):
+    chunk_number = 0
+    chunk_paths = []
+    for c in count(start=0, step=audio_chunk_size):
+        data, rate = librosa.core.load(output_path.format(name, ext), sr=None, offset=c, duration=audio_chunk_size)
+        if data.size == 0:
+            break
+
+        ## Most memory consuming line
+        reduced_noise = nr.reduce_noise(audio_clip=data, noise_clip=noise, verbose=False)
+
+        chunk_output_path = output_path.format(f"{name}_{chunk_number}", "flac")
+        sf.write(chunk_output_path, reduced_noise, rate)
+        chunk_paths.append(chunk_output_path)
+        chunk_number += 1
+
+    return chunk_paths
+
+
 def lambda_handler(event, context):
 
-    output_path = "/tmp/{}.{}"
-
     for record in event["Records"]:
+        output_paths = []
         prefix, name, ext = "", "", ""
         try:
             bucket_name = record["s3"]["bucket"]["name"]
@@ -66,19 +87,23 @@ def lambda_handler(event, context):
             prefix, name, ext = extract_s3_key_components(s3_obj_key)
             if ext not in allowed_extensions:
                 raise Exception("Invalid file extension")
-            download_s3_object(bucket_name, s3_obj_key, output_path.format(name, ext))
-            data, rate = librosa.core.load(output_path.format(name, ext), sr=None)
 
-            # perform noise reduction
-            reduced_noise = nr.reduce_noise(audio_clip=data, noise_clip=noise, verbose=False)
-            sf.write(output_path.format(name, "flac"), reduced_noise, rate)
+            download_s3_object(bucket_name, s3_obj_key, output_path.format(name, ext))
+            output_paths.append(output_path.format(name, ext))
+            chunk_paths = reduce_noise(name, ext)
+            if not chunk_paths:
+                raise Exception("Invalid data in file")
+
+            output_paths += chunk_paths
+            ffmpeg_inputs = [ffmpeg.input(in_file) for in_file in chunk_paths]
 
             (
-                ffmpeg.input(output_path.format(name, "flac"))
+                ffmpeg.concat(*ffmpeg_inputs, v=0, a=1)
                 .output(output_path.format(name, "ogg"))
                 .global_args("-loglevel", "error")
                 .run(overwrite_output=True)
             )
+            output_paths.append(output_path.format(name, "ogg"))
 
             new_object_key = f"{prefix}/{name}.ogg"
             upload_s3_object(
@@ -90,9 +115,8 @@ def lambda_handler(event, context):
             logger.exception("Failed to process files")
             return False
         finally:
-            Path(output_path.format(name, ext)).unlink(missing_ok=True)
-            Path(output_path.format(name, "flac")).unlink(missing_ok=True)
-            Path(output_path.format(name, "ogg")).unlink(missing_ok=True)
+            for path in output_paths:
+                Path(path).unlink(missing_ok=True)
 
     return True
 
