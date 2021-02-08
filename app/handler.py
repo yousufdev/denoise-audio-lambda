@@ -80,6 +80,10 @@ def lambda_handler(event, context):
     for record in event["Records"]:
         output_paths = []
         prefix, name, ext = "", "", ""
+        s3_obj_size_kb = record["s3"]["object"]["size"] / 1000
+        if s3_obj_size_kb < 100:
+            print(f"object_size: {s3_obj_size_kb}KB, skipping because it might not contain useful data")
+            continue
         try:
             bucket_name = record["s3"]["bucket"]["name"]
             s3_obj_key = record["s3"]["object"]["key"]
