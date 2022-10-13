@@ -139,3 +139,5 @@ cython_debug/
 
 .vscode
 experiments/*
+
+noisy_audios/*
